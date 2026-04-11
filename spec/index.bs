@@ -2017,6 +2017,20 @@ worker=] attempted to handle the request but failed.
                 handler {{IdentityRequestEvent/respondWith()}} promise resolved with a
                 non-Response value.
             1. Set |result| to failure and return.
+        1. If |response|'s [=response/type=] is not "`basic`" and |response|'s [=response/type=]
+            is not "`default`":
+            1. The user agent SHOULD [=report a warning to the console=] that the identity
+                handler response must be same-origin with the [=IDP=] or service
+                worker-constructed.
+            1. Set |result| to failure and return.
+
+            Note: This check ensures that the [=/service worker=] can only provide responses
+            that originate from the [=IDP=]'s own [=/origin=] ("`basic`" [=response/type=]) or
+            that are constructed directly by the [=/service worker=] ("`default`"
+            [=response/type=]). Cross-origin responses ("`cors`", "`opaque`",
+            "`opaqueredirect`") are rejected. This matches the behavior of the normal
+            credentialed fetch, which always targets same-origin [=IDP=] endpoints with
+            [=request/redirect mode=] set to "`error`".
         1. If |response|'s [=response/status=] is not an [=ok status=]:
             1. The user agent SHOULD [=report a warning to the console=] that the identity
                 handler response had a non-ok status.
