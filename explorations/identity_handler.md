@@ -14,7 +14,7 @@ This document describes the **FedCM Identity Handler**, a proposed feature that 
 
 ## Status
 
-This explainer documents a **proposed addition** to the FedCM specification, tracked in [PR #815](https://github.com/w3c-fedid/FedCM/pull/815). The proposal would let an IDP-controlled Service Worker intercept FedCM's credentialed fetches (accounts, id_assertion, disconnect).
+This explainer documents a **proposed addition** to the FedCM specification. The proposal would let an IDP-controlled Service Worker intercept FedCM's credentialed fetches (accounts, id_assertion, disconnect).
 
 The underlying request was discussed in the WG on [23 September 2025](https://github.com/w3c-fedid/meetings/blob/main/2025/2025-09-23-FedCM-notes.md) and editors agreed to pursue it; the credentialed-endpoints-only scoping cleared privacy review. Spec mechanics — registration model, internal-field preservation, header allowlist, and the dispatch shape (re-using `FetchEvent` vs. a new dedicated event) — are still being worked out. See [Open Design Discussions](#open-design-discussions).
 
@@ -58,36 +58,31 @@ Three approaches to opening the SW seam were evaluated before converging on the 
 
 The most conservative spec change: replace `service-workers mode: "none"` with `"all"` on FedCM's credentialed requests. Fetch's *HTTP fetch* algorithm would then call the Service Worker spec's [*Handle Fetch*](https://www.w3.org/TR/service-workers/#handle-fetch), which fires a `FetchEvent` at the controlling SW.
 
-**Why this cannot work as a spec-only change.** *Handle Fetch* resolves the dispatch target via the request's **client** — but FedCM sets `request's client = null` uniformly on every endpoint ([disconnect](Q:/Feature-Work/FedCM-SW/original_index.bs#L589), [well-known](Q:/Feature-Work/FedCM-SW/original_index.bs#L1187), [config](Q:/Feature-Work/FedCM-SW/original_index.bs#L1228), [accounts](Q:/Feature-Work/FedCM-SW/original_index.bs#L1353), [account picture](Q:/Feature-Work/FedCM-SW/original_index.bs#L1434), [id_assertion](Q:/Feature-Work/FedCM-SW/original_index.bs#L1503), [client_metadata](Q:/Feature-Work/FedCM-SW/original_index.bs#L1707)). With no client, the standard *Handle Fetch* algorithm has nothing to dispatch through — the request would still flow straight to the network. The `client = null` choice is structural (FedCM requests are initiated by the UA in response to the FedCM API call, not by any document-bound subresource fetch), so it cannot simply be relaxed. Additional spec machinery is required to define **how** the SW is found in the first place.
+**Why this cannot work as a spec-only change.** *Handle Fetch* dispatches via the request's **client** — but per the [FedCM spec](https://fedidcg.github.io/FedCM/), every endpoint (disconnect, well-known, config, accounts, account picture, id_assertion, client_metadata) sets `client = null` in its request shape. That choice is structural — FedCM requests are initiated by the UA, not by any document — so *Handle Fetch* has nothing to dispatch through and the request goes straight to the network.
 
 #### Approach B — Browser-side dispatch layer that calls the SW directly, bypassing standard `Handle Fetch`
 
-A prototype along these lines exists at [Chromium CL 7206662](https://chromium-review.googlesource.com/c/chromium/src/+/7206662). It introduces a FedCM-specific `URLLoaderFactory` that:
+An alternative would be for the browser to ship a FedCM-specific dispatch layer that bypasses standard *Handle Fetch* entirely: look up the IDP's SW registration by URL **scope** (not by a controlling client, which FedCM doesn't have), construct an internal request from the FedCM call, invoke the SW's `fetch` event directly, and fall back to the network if no SW is registered or the SW does not respond. The intent is to provide the missing dispatch primitive purely on the browser side — and this has been prototyped, demonstrating it is implementable today without spec changes to Fetch or Service Worker.
 
-1. Looks up the IDP's SW registration by URL **scope** (storage-key based, not client-based).
-2. Builds a `FetchAPIRequest` from the FedCM internal request.
-3. Invokes `ServiceWorkerFetchDispatcher` directly to fire a `fetch` event at the IDP's SW.
-4. Falls back to the network factory if no SW is registered or the SW does not respond.
-
-This implements the missing dispatch primitive in the browser. However, the corresponding **spec direction** — extending Fetch / Service Worker so the *spec* can dispatch a `FetchEvent` to a SW with no controlling client — was not endorsed by reviewers on the [Chromium service-worker-discuss thread](https://groups.google.com/a/chromium.org/g/service-worker-discuss/c/t9d33x6l718):
+However, the corresponding **spec direction** — extending Fetch / Service Worker so the *spec* can dispatch a `FetchEvent` to a SW with no controlling client — was not endorsed by reviewers on the [Chromium service-worker-discuss thread](https://groups.google.com/a/chromium.org/g/service-worker-discuss/c/t9d33x6l718):
 
 - **No initiating client** (Ben Kelly). Standard SW semantics dispatch `FetchEvent` to the SW controlling the *initiating client*. FedCM has no initiating client, and the dispatch target is the *destination* origin's SW — the same dispatch shape used by the deprecated [foreign fetch](https://github.com/whatwg/fetch/issues/506), which the SW WG removed for similar reasons.
 - **Risk to deployed SWs.** Any IDP SW with a generic `fetch` handler would suddenly receive FedCM requests it was not written to handle. The opt-in is implicit (the SW exists), not explicit.
 - **Procedural asks** (Dominic Farolino). A formal spec design section, Chrome security / privacy review, cross-vendor review, and TAG review were called out as prerequisites before reusing `FetchEvent` for this dispatch shape.
 
-CL 7206662 remains useful as a reference for the browser-side dispatch primitives, but the spec path of "reuse `FetchEvent` via *Handle Fetch*" was not pursued on the basis of the thread feedback.
+The browser-side dispatch is implementable today, but the spec path of "reuse `FetchEvent` via *Handle Fetch*" was not pursued on the basis of the thread feedback.
 
 #### Approach C — Dedicated event, modeled on Payment Handler (current direction)
 
-The shape suggested by reviewers in the SW WG thread, and currently captured in [PR #815](https://github.com/w3c-fedid/FedCM/pull/815): introduce a purpose-built event (`IdentityRequestEvent`) that the SW must explicitly listen for. The dispatch model is borrowed directly from the [Payment Handler API](https://w3c.github.io/web-based-payment-handler/), which faces the same shape of problem (UA-initiated request, destination-origin SW, no controlling client) and resolves it the same way — Payment Handler dispatches `"paymentrequest"` (and `"canmakepayment"`) using the Service Worker spec's [*Fire Functional Event ... on registration*](https://www.w3.org/TR/service-workers/#fire-functional-event) primitive, which targets a `ServiceWorkerRegistration`'s active worker directly **without** going through *Handle Fetch* or `request's client`. That is exactly the gap that blocks Approach A, and Approach C borrows the same primitive for FedCM. (The corresponding registration surface — how the SW gets associated with a specific IDP config in the first place — is a separate question, captured in [Open Design Discussions §a](#a-service-worker-registration).)
+The shape suggested by reviewers in the SW WG thread, introduce a purpose-built event (`IdentityRequestEvent`) that the SW must explicitly listen for. The dispatch model is borrowed directly from the [Payment Handler API](https://w3c.github.io/web-based-payment-handler/), which faces the same shape of problem (UA-initiated request, destination-origin SW, no controlling client) and resolves it the same way — Payment Handler dispatches `"paymentrequest"` (and `"canmakepayment"`) using the Service Worker spec's [*Fire Functional Event ... on registration*](https://www.w3.org/TR/service-workers/#fire-functional-event) primitive, which targets a `ServiceWorkerRegistration`'s active worker directly **without** going through *Handle Fetch* or `request's client`. That is exactly the gap that blocks Approach A, and Approach C borrows the same primitive for FedCM. (The corresponding registration surface — how the SW gets associated with a specific IDP config in the first place — is a separate question, captured in [Open Design Discussions §b](#b-service-worker-registration).)
 
 The dedicated-event design makes the unusual dispatch model **explicit at the API surface** rather than overloading `FetchEvent`. It addresses each of the Approach B concerns:
 
-- The new event has no client-resolution dependency — dispatch is anchored to whichever IDP-config-to-SW-registration binding the registration surface (see [§a](#a-service-worker-registration)) defines, and fired directly on that registration.
+- The new event has no client-resolution dependency — dispatch is anchored to whichever IDP-config-to-SW-registration binding the registration surface (see [§b](#b-service-worker-registration)) defines, and fired directly on that registration.
 - Pre-existing IDP SWs that only listen for `fetch` are not affected; only SWs that explicitly register the new event type participate.
 - Being a different event entirely sidesteps the "is this foreign fetch in disguise?" critique against reusing `FetchEvent`.
 
-This is the approach described in *How It Works* below. The detailed tradeoff comparison between Approach B and Approach C is recorded in [Open Design Discussions §d](#d-dispatch-shape--fetchevent-vs-a-dedicated-event); registration-shape options are in [§a](#a-service-worker-registration); and field-preservation mechanics are in [§b](#b-keeping-lock-down-properties-intact-when-fetch-is-called-from-the-sw).
+This is the approach described in *How It Works* below.
 
 ### How It Works
 
@@ -97,7 +92,7 @@ This section describes **Approach C** in detail.
 
 The IDP makes its Service Worker available to the FedCM dispatch path. The Service Worker is hosted at the IDP origin and only sees `identityrequest` events when it has explicitly indicated that it is intended to handle them.
 
-The precise registration surface — how the IDP signals that intent to the user agent — is an open design question. See [Open Design Discussions §a](#a-service-worker-registration) for the options under consideration.
+The precise registration surface — how the IDP signals that intent to the user agent — is an open design question. See [Open Design Discussions §b](#b-service-worker-registration) for the options under consideration.
 
 #### 2. Browser Dispatches `IdentityRequestEvent` to the SW
 
@@ -215,12 +210,11 @@ When the SW forwards a FedCM request, it may attach additional headers (e.g., a 
 Headers UA-set on the FedCM internal request (`Accept`, `Sec-Fetch-*`, `Cookie`, `Origin`,
 `Referer`) must **not** be overridden by the SW.
 
-The exact set of header names the SW is permitted to add, and the process for growing that
-set, is still being worked out — see [Open Design Discussions §c](#c-other-areas-of-active-discussion).
+The exact set of header names the SW is permitted to add, and the process for growing that set, is still being worked out (called out in [Status](#status) alongside the other open spec mechanics).
 
 ### Response Type Restriction
 
-The `Response` returned to `respondWith` must have a [response type](https://fetch.spec.whatwg.org/#concept-response-type) of `"basic"` (the response came from a same-origin fetch — i.e., from the IDP's own network endpoint) or `"default"` (the SW constructed the response directly, e.g., via `new Response(...)`, rather than fetching it). Responses of type `"cors"`, `"opaque"`, `"opaqueredirect"`, or `"error"` are rejected. This ensures the response can only originate from the IDP's own origin (or from same-origin SW code), matching the UA-direct path which uses `redirect mode: "error"` on requests whose URL targets the IDP.
+The `Response` returned to `respondWith` must satisfy: its [URL](https://fetch.spec.whatwg.org/#concept-response-url) is same-origin to the IDP, **or** its [type](https://fetch.spec.whatwg.org/#concept-response-type) is `"default"` (SW-synthesized via `new Response(...)`). `"opaque"`, `"opaqueredirect"`, and `"error"` are rejected outright. `"cors"` is accepted only when the URL is same-origin to the IDP — the legitimate shape for `id_assertion` / `disconnect`, where `mode: "cors"` plus an RP-origin request makes Fetch tag the response `"cors"` even though it came from the IDP itself. Any other origin is rejected, blocking the SW from laundering cross-origin data through the FedCM channel. 
 
 ## Benefits
 
@@ -332,21 +326,7 @@ Cross-origin Service Worker interception is architecturally impossible.
 
 ### Sec-Fetch-Dest: webidentity
 
-On the UA-direct path, the browser stamps `Sec-Fetch-Dest: webidentity` — a forbidden header JavaScript cannot set — so the IDP can confirm the request came from the FedCM API, not from page-initiated script. The SW path must preserve the same guarantee: `event.request.destination` is `"webidentity"` (read-only to the SW), and the header must reach the IDP unchanged when the SW forwards the request. Otherwise the SW path silently weakens a marker the UA-direct path provides.
-
-> **Why preserve `Sec-Fetch-Dest: webidentity` if the SW is already attaching a PoP proof?**
->
-> A reasonable question — if the SW attaches a DPoP / Entra-JWT / mTLS-style proof, does the UA-stamped `Sec-Fetch-Dest: webidentity` marker still matter? Three reasons it does:
->
-> 1. **Not every IDP attaches PoP.** SW interception is opt-in, and even an IDP that ships a SW may not attach a proof to every request. The spec must work for IDPs that rely only on cookies. `Sec-Fetch-Dest: webidentity` is the universal CSRF marker that lets *any* IDP server tell a real FedCM call apart from a page-initiated XHR — independent of whether a PoP scheme is in play.
->
-> 2. **PoP and `Sec-Fetch-Dest` answer different questions.** PoP says "this request came from a holder of this device's private key." `Sec-Fetch-Dest: webidentity` says "this request came through the FedCM API surface, with the UA's mediation and consent UI." An IDP may legitimately want both: a credential is only honored if it is *both* device-bound *and* arriving on the FedCM path — so the server can be sure the matching consent flow ran. PoP alone does not vouch for the path the request took.
->
-> 3. **The cookie-scope invariant is unrelated to PoP.** The UA-stamped opaque `origin` is what causes the cookie layer to send only `SameSite=None` cookies. If the SW path resets `origin` to `https://idp.example`, *all* same-site cookies (`Lax`, `Strict`) are sent on the wire — a data exposure that PoP does not undo. Preserving the lock-down protects this property regardless of whether the IDP attaches a proof.
->
-> Put differently: PoP is an *IDP-defined* assertion about the client. The lock-down (`Sec-Fetch-Dest`, opaque origin, `redirect mode: "error"`, `referrer policy: "no-referrer"`) is a *UA-vouched* set of properties about how the request was made. They are layered defenses, not substitutes.
-
-When the SW forwards the request via `fetch(event.request)`, that preservation is at risk — passing through the public `Request` constructor / Fetch algorithm can reset some of the UA-set internal fields. How the spec preserves these fields end-to-end across SW forwarding is an open design question — see [Open Design Discussions §b](#b-keeping-lock-down-properties-intact-when-fetch-is-called-from-the-sw).
+On the UA-direct path, the browser stamps `Sec-Fetch-Dest: webidentity` — a forbidden header JavaScript cannot set — so the IDP can confirm the request came from the FedCM API, not from page-initiated script. In the SW path, `event.request.destination` is read-only and equal to `"webidentity"`. Whether the header reaches the IDP unchanged when the SW forwards via `fetch(event.request)` — and whether the spec should mechanically enforce that it does — is an open question, captured in [Open Design Discussions §c](#c-should-the-spec-enforce-lock-down-properties-when-fetch-is-called-from-the-sw).
 
 ### Redirect Prevention
 
@@ -365,7 +345,7 @@ This ensures that SW failures never block authentication — the flow degrades g
 ## Developer Experience
 
 **IDP developers** opt in by:
-1. Registering a Service Worker that handles FedCM (mechanism under discussion — see [Open Design Discussions §a](#a-service-worker-registration))
+1. Registering a Service Worker that handles FedCM (mechanism under discussion — see [Open Design Discussions §b](#b-service-worker-registration))
 2. Implementing an `identityrequest` event handler in their SW
 3. Using standard web APIs (Fetch, Cache, Crypto) within the handler, subject to the augmenting header allowlist
 
@@ -379,90 +359,150 @@ This ensures that SW failures never block authentication — the flow degrades g
 
 ## Open Design Discussions
 
-The following design questions are still being worked out in [PR #815](https://github.com/w3c-fedid/FedCM/pull/815). They are recorded here so the explainer can be discussed independently of the spec text.
-
-### a) Service Worker Registration
-
-How does an IDP register a Service Worker for FedCM, and how does the UA know which registration to dispatch `identityrequest` events to?
-
-Options under consideration include:
-
-- **Opt-in flag on the existing registration.** The IDP registers its SW with the standard `navigator.serviceWorker.register(...)` API and passes a new option (e.g., `acceptsFedCM: true`) on `RegistrationOptions`. SWs without the flag are invisible to FedCM dispatch. Lowest spec and IDP cost; the SW lifecycle remains owned by the IDP page.
-- **Dedicated FedCM-only registration.** A separate `registerForFedCM(...)` API stores the FedCM SW in a parallel registry that is invisible to `getRegistration()` / `getRegistrations()`. Strongest registry-level isolation but a much larger spec surface (new IDL, new lifecycle algorithms, cross-cutting interactions with `Clients`, `BroadcastChannel`, push, etc.), and IDPs run two SWs with shared-state coordination.
-- **Separate FedCM storage partition.** Adds a separate storage partition on top of the dedicated registration. Maximal isolation, but IDPs cannot share keys / caches / preferences across the two SWs without runtime `postMessage` choreography.
-- **Dedicated manager extending `ServiceWorkerRegistration` (e.g., `registration.identity`).** Follow the architectural pattern used by the [Payment Handler API](https://w3c.github.io/web-based-payment-handler/) — and similar features like Periodic Background Sync and Notifications — by extending `ServiceWorkerRegistration` with a dedicated interface. Payment Handler does this with `registration.paymentManager`, on which the page calls `paymentManager.instruments.set(instrumentKey, ...)` to declare what the handler can serve. FedCM would do the same with `registration.identity` (an `IdentityProviderManager`) and `registration.identity.register(configURL)`. This creates a one-to-one mapping between the IDP config URL and the SW registration, so functional events are only dispatched to workers that have intentionally opted in for that specific provider. (`configURL` is used here because it is the unique identifier for an `IdentityProviderConfig`.) This addresses the semantic mismatch of using the implicit `Match Service Worker Registration` algorithm for internal UA requests that lack a controlled client. It also provides a clear lifecycle: unlinking via `registration.identity.unregister(configURL)`, or implicitly through removal of the parent registration. **Of the options listed here, this is the closest precedent to Payment Handler's shape and the most direct fit for the dispatch primitive Approach C relies on.**
-
-Reviewer concerns this section needs to resolve:
-
-- Pre-existing SWs (deployed for caching, push, offline) must not accidentally be invoked for FedCM if they add an `identityrequest` listener.
-- FedCM-purposed SWs should not be reachable by unrelated platform features that look up the same registration.
-- The unregistration story should be clear (logout, `Clear-Site-Data`, IDP removal of opt-in).
-
-Two earlier shapes were explored and have been backed out:
-
-- **SW URL declared in the IDP `config.json` (e.g., `"identity_handler": { "service_worker": "/sw.js" }`).** Backed out for a privacy reason. The config file is fetched **per FedCM invocation** with the RP's `client_id` in the request path (`client_metadata`) or otherwise associated with a specific RP call; declaring the SW *inside* the config means the IDP can effectively encode RP-specific values (e.g., `/sw-for-rp-A.js` vs. `/sw-for-rp-B.js`) into the SW script URL that the browser will then register. That collapses the cross-site privacy boundary FedCM is designed to preserve — the SW (and the IDP server that serves the SW script) would learn which RP the user is interacting with, which is exactly what the config-vs-well-known two-tier file system exists to prevent.
-- **SW URL declared in the IDP well-known file (`/.well-known/web-identity`).** Backed out for operational reasons. The well-known file is the IDP's *origin-wide* contract — it must be stable, single-valued, and is fetched without any user / RP context. Encoding a SW script URL there means: (a) **deployment friction** — every SW script-URL change requires editing a top-level well-known file, which on many corporate IDPs requires a separate sign-off and rollout path than the SW build pipeline that produces `/sw.js`; (b) **no scoping** — the well-known file applies to all FedCM configs on the origin, so an IDP cannot opt different configs in/out separately; (c) **lifecycle coupling** — the SW becomes implicitly registered by the UA on first FedCM use, with no Document-owned `register()` call, leaving no natural place for the IDP page to gate registration on user state (logged-in vs. not), call `await registration` for readiness, or run `skipWaiting()` / install logic in tandem with the rest of the IDP's SW.
-- **UA-driven SW registration (browser registers / unregisters the FedCM SW on the IDP's behalf, e.g., on first FedCM invocation or when the config / well-known file changes).** Backed out because it breaks the standard `[[SERVICE-WORKERS]]` ownership model in several ways: (a) **no owning client** — every other path to `register()` runs from a Document or DedicatedWorker that owns the registration's lifecycle, but a UA-driven registration has no such owner, leaving questions like "what triggers `updatefound`?" / "when does the UA call `update()`?" / "how does `Clear-Site-Data` interact with a UA-owned registration?" without natural answers; (b) **scope semantics** — SW scope is derived from the script URL and the registering client; with no client, the spec has to invent FedCM-specific scope rules; (c) **silent SW execution** — a SW registered without the IDP page's knowledge can run install / activate handlers that the IDP did not expect or authorize, which is a footgun for IDPs that already deploy SWs for other purposes; (d) **DevTools / introspection gap** — UA-injected registrations do not naturally surface in `getRegistrations()` or in the DevTools Application > Service Workers panel without bespoke handling, making it hard for IDP developers to verify what is installed and debug failures; (e) **no upgrade story** — when the IDP wants to change its FedCM SW, there is no analog of the standard re-`register()` + `skipWaiting()` flow, so the UA has to define a new update mechanism.
-
-The currently considered options above (opt-in flag, dedicated `registerForFedCM`, separate partition, `registration.identity` manager) all share the property that **the SW is registered through the standard `navigator.serviceWorker.register(...)` pipeline owned by an IDP page**, not declared in a config or well-known file and not injected by the UA. This keeps the SW lifecycle in the hands of IDP code that already has a controlled client, and avoids the RP-correlation channel, the well-known operational issues, and the ownership-model problems described above.
-
-### b) Keeping Lock-Down Properties Intact When `fetch` Is Called From the SW
-
-When the UA constructs the FedCM internal request, it sets a deliberately hardened shape:
-
-| Property | Value | Why |
-|---|---|---|
-| `client` | `null` | No ambient authority leaks |
-| `origin` | fresh **opaque origin** | Cookie layer treats this as cross-site to the IDP → only `SameSite=None` cookies are sent |
-| `destination` | `"webidentity"` | Stamps `Sec-Fetch-Dest: webidentity` on the wire (the FedCM CSRF marker) |
-| `redirect mode` | `"error"` | Prevents IDP-controlled redirects |
-| `referrer policy` | `"no-referrer"` | Prevents RP origin leakage to IDP |
-| `mode` | `"no-cors"` | Bypasses CORS preflight |
-| `credentials mode` | `"include"` | Sends the IDP session cookie |
-| `Accept` | UA-set per endpoint | Forces request / response shape |
-
-When the SW handles the dispatched `identityrequest` event and forwards the request to the network via `fetch(event.request)`, the internal request fields `client`, `origin`, and `destination` are not exposed (or only read-only) through the public `Request` interface today and can be reset as the request flows through the [Fetch](https://fetch.spec.whatwg.org/) `Request` constructor. If they are reset, the wire-level consequences are:
-
-| Wire | UA-direct | Naive `fetch(event.request)` |
-| --- | --- | --- |
-| `Sec-Fetch-Dest` | `webidentity` | `empty` ❌ |
-| `Sec-Fetch-Site` | `cross-site` | `same-origin` ❌ |
-| `Origin` | `null` | `https://idp.example` ❌ |
-| `Cookie` scope | `SameSite=None` only | All cookies, including `SameSite=Lax` / `Strict` ❌ |
-
-The IDP server would no longer be able to tell the SW-mediated request apart from a page-initiated XHR, the FedCM CSRF marker (`Sec-Fetch-Dest: webidentity`) would be gone, and Lax / Strict cookies would be exposed.
-
-Approaches under consideration:
-
-- **Transparent field carry-through.** Define `event.request` so that the internal request fields survive a subsequent `fetch(event.request)` invocation in the SW, without requiring any new JS-visible API.
-- **Fetch / Request spec changes.** Extend the public `Request` constructor / Fetch algorithm so that the locked-down properties round-trip through the standard SW forwarding path.
-- **Dedicated forwarding helper.** Introduce a purpose-built method on `IdentityRequestEvent` that invokes [=fetching=] directly on the UA's stored internal request, bypassing the public `Request` constructor entirely. The helper would also be the natural place to enforce the augmenting-header allowlist.
-
-Whichever approach is chosen, the spec requires the same end-state: the request that hits the wire after SW forwarding is byte-for-byte equivalent to the UA-direct request (optionally with allowlisted augmenting headers added).
-
-### d) Dispatch Shape — `FetchEvent` vs. a Dedicated Event
+### a) Dispatch Shape — `FetchEvent` vs. a Dedicated Event
 
 How should the FedCM credentialed call surface inside the SW? The two shapes under consideration are:
 
 - **Reuse `FetchEvent`.** The browser routes the FedCM internal request through the standard SW dispatch path; the IDP's existing `fetch` handler sees the request (distinguished by `Sec-Fetch-Dest: webidentity` and `request.destination === "webidentity"`) and decides whether to handle it.
 - **Introduce a dedicated event** (e.g., `IdentityRequestEvent`). The browser dispatches a purpose-built event the SW must explicitly listen for; SWs that only have a `fetch` handler are not invoked.
 
-The tradeoffs were discussed on the [Chromium service-worker-discuss thread](https://groups.google.com/a/chromium.org/g/service-worker-discuss/c/t9d33x6l718). At a high level:
+The tradeoffs were discussed on the [Chromium service-worker-discuss thread](https://groups.google.com/a/chromium.org/g/service-worker-discuss/c/t9d33x6l718). The service-worker editors' core architectural objection to reusing `FetchEvent` was stated directly on that thread:
+
+> FedCM's request — which has no controlled client and is dispatched to the *destination* origin's SW rather than an *initiating* origin's SW — does not fit standard subresource-fetch semantics, and resembles the deprecated [foreign fetch](https://github.com/whatwg/fetch/issues/506).
+
+In standard `FetchEvent` semantics, the controlling SW is the one belonging to the **page that initiated the request** — the request's *client*. FedCM inverts both halves of that contract:
+
+- **No client.** FedCM sets `request's client = null` on every credentialed endpoint, because the request is initiated by the UA in response to the FedCM API call, not by a document-bound subresource fetch. Standard *Handle Fetch* has nothing to dispatch through.
+- **Destination-origin dispatch, not initiator-origin.** The SW we want to invoke belongs to the **IDP** (the request's destination), not to the RP page that initiated the FedCM call. This is the exact inversion that the [foreign fetch](https://github.com/whatwg/fetch/issues/506) proposal tried to standardise — and that was removed from the platform for being too dangerous a primitive (cross-origin SWs intercepting requests destined for their own origin, with all the trust-boundary questions that opens).
+
+In plain terms: reusing `FetchEvent` for FedCM is foreign fetch in a smaller box — same shape (one origin's SW intercepting requests aimed at it from elsewhere), just narrower scope. That is what the editors pushed back on, and what the dedicated-event option avoids by giving this unusual dispatch its own event instead of overloading `FetchEvent`.
+
+The remaining tradeoff is spec cost vs. IDP-deployment risk:
 
 | Aspect | `FetchEvent` reuse | Dedicated event |
 |---|---|---|
-| Spec surface | Smallest — a flag flip on `service-workers mode` plus the augmenting-header rules | Larger — new IDL, new dispatch algorithm |
-| Opt-in model | Implicit — any SW with a `fetch` handler that happens to match the URL would intercept | Explicit — only SWs that register the new event type participate |
-| Risk to deployed SWs | Pre-existing IDP SWs deployed for caching / push / offline would suddenly receive FedCM requests they were not written to handle | None — the new event is invisible to existing handlers |
-| Alignment with SW architecture | Concerns raised on the thread that FedCM's request — which has no controlled client and is dispatched to the *destination* origin's SW rather than an *initiating* origin's SW — does not fit standard subresource-fetch semantics, and resembles the deprecated [foreign fetch](https://github.com/whatwg/fetch/issues/506) | A dedicated event makes the unusual dispatch model explicit at the API level rather than overloading `FetchEvent` |
-| Reviewer asks | The thread (D. Farolino, B. Kelly) called for a formal spec design doc, Chrome security/privacy review, other-vendor review, and TAG review before reusing `FetchEvent` for this | Largely sidesteps the "is this foreign fetch in disguise?" critique by being a different event entirely |
+| **Spec surface** | Smallest — a flag flip on `service-workers mode` plus the augmenting-header rules | Larger — new IDL, new dispatch algorithm |
+| **Risk to deployed SWs** | Pre-existing IDP SWs (caching, push, offline) would silently start receiving FedCM requests; every existing `fetch` handler needs a `destination === "webidentity"` early-exit retrofit | None — the new event is invisible to existing handlers |
 
-**Status.** No final decision. The dedicated-event direction is currently captured in [PR #815](https://github.com/w3c-fedid/FedCM/pull/815) and is the shape used in this explainer's examples, but the choice is not settled.
+### b) Service Worker Registration
+
+How does an IDP register a Service Worker for FedCM, and how does the UA know which registration to dispatch `identityrequest` events to?
+
+#### 1. SW path/scope declared in well-known + IDP-page registration
+
+**How it works.**
+
+1. The IDP's `/.well-known/web-identity` declares an `identity_handler` field — either a literal SW path or a scope pattern:
+
+   ```json
+   {
+     "provider_urls": ["https://idp.example/fedcm/config.json"],
+     "identity_handler": "/fedcm/sw.js"      // literal path
+     // -or-
+     "identity_handler": "/fedcm/*"          // scope pattern
+   }
+   ```
+
+2. The IDP **page** calls the standard `navigator.serviceWorker.register("/fedcm/sw.js")` — Document-owned registration, standard SW install / activate / update lifecycle, SW lands in the IDP's first-party storage partition.
+
+3. When a FedCM call happens, the browser will only forward it to a service worker whose URL was pre-listed in `identity_handler` in the well-known file — any other service worker on the IDP origin is ignored. The eligible registration receives `identityrequest` via [*Fire Functional Event ... on registration*](https://www.w3.org/TR/service-workers/#fire-functional-event).
+
+Since the well-known file is served by the IDP's own server, an XSS on any IDP page cannot tamper with the allowlist.
+
+**Literal path vs. scope pattern — IDP operational trade-off.**
+
+| Aspect | Literal path (`/fedcm/sw.js`) | Scope pattern (`/fedcm/*`) |
+| --- | --- | --- |
+| Filename change | Edit well-known each time | Free under the prefix |
+| Content-hashed builds (`sw.a3f7b2.js`) | Forces a shim or breaks the convention | Native fit |
+| Gradual rollout / canary / A/B | Server-side cohort variation on one URL | Per-cohort URLs under the prefix |
+| Multi-tenant / multi-env | One SW for all tenants | Sub-scope per tenant/env |
+| Spec & IDP complexity | Trivial (string equality) | Requires URL-matching grammar |
+
+#### 2. Dedicated manager extending `ServiceWorkerRegistration` (`registration.identity`)
+
+**How it works.**
+
+1. The IDP page calls standard `register()` plus a new IDL surface borrowed from the [Payment Handler API](https://w3c.github.io/web-based-payment-handler/) (which uses `registration.paymentManager`):
+
+   ```js
+   const reg = await navigator.serviceWorker.register("/fedcm/sw.js");
+   await reg.identity.register("https://idp.example/fedcm/config.json");
+   ```
+
+2. `registration.identity` is an `IdentityProviderManager`. Calling `identity.register(configURL)` declares a one-to-one binding between this SW registration and the named IDP config. Same-origin enforcement applies: `configURL` must be same-origin to the SW script. Lifecycle: `identity.unregister(configURL)`, or implicit removal when the parent registration is removed.
+
+3. The UA records `(configURL → registration)` and dispatches `identityrequest` on FedCM calls matching that configURL via the same *Fire Functional Event ... on registration* primitive.
+
+Brings the cleanest per-configURL binding — one SW per IDP config, mirroring the Payment Handler architectural precedent and giving multi-tenant IDPs a dedicated SW per config out of the box.
+
+**IDP operational constraints.**
+
+| Constraint | What it means for the IDP |
+| --- | --- |
+| Login-flow coupling | SW only registers when an IDP page runs `identity.register()`. No IDP page open → no registration → FedCM falls back to UA-direct. |
+| XSS exposure | Any IDP-origin JS that can call `register()` + `identity.register()` claims the slot. No server-side allowlist; defense = strict XSS hygiene on every IDP page. |
+| Per-configURL bookkeeping | One `register()` / `unregister()` call per supported configURL. |
+| Feature detection | New IDL — IDP must check `'identity' in reg` and fall back on older browsers. |
+| No declarative discovery | Nothing in well-known or `config.json` advertises the SW; only observable after `identity.register()` runs. |
+
+#### Cross-cutting reviewer concerns (apply to all three)
+
+- Pre-existing SWs (deployed for caching, push, offline) must not accidentally be invoked for FedCM if they add an `identityrequest` listener.
+- FedCM-purposed SWs should not be reachable by unrelated platform features that look up the same registration.
+- The unregistration story should be clear (logout, `Clear-Site-Data`, IDP removal of opt-in).
+
+#### Backed-out shape
+
+- **SW URL declared in the IDP `config.json`** (e.g., `"identity_handler": { "service_worker": "/sw.js" }` inside `config.json`). **Fails privacy** — the IDP can encode RP-specific values into the URL (`/sw-for-rp-A.js` vs. `/sw-for-rp-B.js`), so the SW (and the IDP server serving the SW script) would learn which RP the user is interacting with.
+
+### c) Should the Spec Enforce Lock-Down Properties When `fetch` Is Called From the SW?
+
+On the UA-direct path, the FedCM internal request has a deliberately hardened shape on the wire:
+
+| Property | Value | Why |
+|---|---|---|
+| `client` | `null` | No ambient authority leaks |
+| `origin` | accounts: fresh **opaque origin**<br>id_assertion / disconnect: **RP document's origin** | Cookie layer treats the request as cross-site to the IDP → only `SameSite=None` cookies are sent. For accounts the opaque origin also keeps the IDP from learning the RP. For id_assertion / disconnect the IDP **needs** the RP origin — to mint a token bound to it and to authorize sharing the response via CORS — so the RP origin is on the wire instead. |
+| `destination` | `"webidentity"` | Stamps `Sec-Fetch-Dest: webidentity` on the wire (the FedCM CSRF marker) |
+| `redirect mode` | `"error"` | Prevents IDP-controlled redirects |
+| `referrer policy` | `"no-referrer"` | Suppresses the `Referer` header (the `Origin` header still carries RP identity on id_assertion / disconnect by design) |
+| `mode` | accounts: `"no-cors"`<br>id_assertion / disconnect: `"cors"` | accounts response is consumed by the UA only — no CORS handshake needed. id_assertion / disconnect responses flow to the RP — CORS is the IDP's explicit opt-in (premise S4). |
+| `credentials mode` | `"include"` | Sends the IDP session cookie |
+| `Accept` | UA-set per endpoint | Forces request / response shape |
+
+When the SW forwards via `fetch(event.request)`, the internal request fields `client`, `origin`, and `destination` are not exposed (or are only read-only) through the public `Request` interface today, so they can be reset as the request flows through the [Fetch](https://fetch.spec.whatwg.org/) `Request` constructor. If they are reset, the wire diverges from the UA-direct shape:
+
+| Wire | UA-direct | Naive `fetch(event.request)` |
+| --- | --- | --- |
+| `Sec-Fetch-Dest` | `webidentity` | `empty` ❌ |
+| `Sec-Fetch-Site` | `cross-site` | `same-origin` ❌ |
+| `Origin` | `null` (accounts) / `https://rp.example` (id_assertion, disconnect) | `https://idp.example` ❌ |
+| `Cookie` scope | `SameSite=None` only | All cookies, including `SameSite=Lax` / `Strict` ❌ |
+
+In that downgraded form, the IDP server could no longer tell the SW-mediated request apart from a page-initiated XHR, the FedCM CSRF marker (`Sec-Fetch-Dest: webidentity`) would be missing, and `SameSite=Lax` / `Strict` cookies would be exposed.
+
+**Does the IDP's own PoP proof make the lock-down redundant?**
+
+A reasonable counter-argument: if an SW already attaches a DPoP / Entra-JWT / mTLS-style proof, does the UA-stamped `Sec-Fetch-Dest: webidentity` (and the rest of the lock-down) still matter? Three reasons it does:
+
+1. **Not every IDP attaches PoP.** SW interception is opt-in, and even an IDP that ships a SW may not attach a proof to every request. The spec must work for IDPs that rely only on cookies — for them, `Sec-Fetch-Dest: webidentity` is the universal CSRF marker that lets the IDP server tell a real FedCM call apart from a page-initiated XHR.
+2. **PoP and `Sec-Fetch-Dest` answer different questions.** PoP says "this request came from a holder of this device's private key." `Sec-Fetch-Dest: webidentity` says "this request came through the FedCM API surface, with the UA's mediation and consent UI." An IDP may legitimately want both: a credential honored only if *both* device-bound *and* arriving on the FedCM path. PoP alone does not vouch for the path the request took.
+3. **The cookie-scope invariant is unrelated to PoP.** Preserving the request `origin` set by the UA (opaque for accounts; RP origin for id_assertion / disconnect) is what keeps the cookie layer from sending `SameSite=Lax` / `Strict` cookies. PoP does not undo a cookie exposure that already happened on the wire.
+
+The lock-down is a **UA-vouched** set of properties about how the request was made; PoP is an **IDP-defined** assertion about the client. They are layered defenses, not substitutes — which makes the enforcement question non-trivial even in a PoP world.
+
+**Open question.** Should the spec mechanically enforce that the lock-down shape survives the SW forwarding round-trip, or document it as an IDP-side contract and rely on each SW author to forward correctly?
+
+If enforced, the probable options are:
+
+- **Dedicated forwarding helper.** Introduce a purpose-built method on `IdentityRequestEvent` that invokes [=fetching=] directly on the UA's stored internal request, bypassing the public `Request` constructor entirely. The helper would also be the natural place to enforce the augmenting-header allowlist. Most FedCM-local solution, but adds new IDL and asks SW authors to learn a non-`fetch` forwarding API.
+- **Fetch / Request spec changes.** Extend the public `Request` constructor and Fetch algorithm so the locked-down properties round-trip through the standard SW forwarding path for any caller, not just FedCM. Broadest reach, smallest FedCM-specific surface, but a much larger spec change touching general Fetch semantics.
+
 
 ## References
 
 - [FedCM Specification](https://fedidcg.github.io/FedCM/)
-- [FedCM Identity Handler section](https://fedidcg.github.io/FedCM/#identity-handler)
 - [Spec PR #815 — Enabling IDP Interception in FedCM Request](https://github.com/w3c-fedid/FedCM/pull/815)
 - [GitHub Issue #80 — SW interception for FedCM](https://github.com/w3c-fedid/FedCM/issues/80)
 - [WG meeting notes (23 Sept 2025) — agreement to pursue SW interception](https://github.com/w3c-fedid/meetings/blob/main/2025/2025-09-23-FedCM-notes.md)
